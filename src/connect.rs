@@ -4,10 +4,11 @@ use http::uri::{Authority, Scheme};
 use http::Uri;
 use hyper::rt::{Read, ReadBufCursor, Write};
 use hyper_util::client::legacy::connect::{Connected, Connection};
-#[cfg(any(feature = "socks", feature = "__tls"))]
+#[cfg(any(feature = "socks", feature = "__tls", unix))]
 use hyper_util::rt::TokioIo;
 #[cfg(feature = "default-tls")]
 use native_tls_crate::{TlsConnector, TlsConnectorBuilder};
+use tokio::net::UnixStream;
 use tower_service::Service;
 
 use pin_project_lite::pin_project;
@@ -18,6 +19,8 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
+#[cfg(unix)]
+use std::path::Path;
 
 #[cfg(feature = "default-tls")]
 use self::native_tls_conn::NativeTlsConn;
@@ -203,6 +206,16 @@ impl Connector {
         self.verbose.0 = enabled;
     }
 
+    #[cfg(unix)]
+    async fn connect_unix_socket<P: AsRef<Path>>(&self, socket: P) -> Result<Conn, BoxError> {
+        let unix_stream = unix_socket_conn::connect(socket).await?;
+        Ok(Conn {
+            inner: self.verbose.wrap(unix_stream),
+            is_proxy: false, // defaults to false to have the same behavior as curl's --unix-socket
+            tls_info: false,
+        })
+    }
+
     #[cfg(feature = "socks")]
     async fn connect_socks(&self, dst: Uri, proxy: ProxyScheme) -> Result<Conn, BoxError> {
         let dns = match proxy {
@@ -213,6 +226,10 @@ impl Connector {
                 remote_dns: true, ..
             } => socks::DnsResolve::Proxy,
             ProxyScheme::Http { .. } | ProxyScheme::Https { .. } => {
+                unreachable!("connect_socks is only called for socks proxies");
+            }
+            #[cfg(unix)]
+            ProxyScheme::UnixSocket { .. } => {
                 unreachable!("connect_socks is only called for socks proxies");
             }
         };
@@ -368,6 +385,8 @@ impl Connector {
             ProxyScheme::Https { host, auth } => (into_uri(Scheme::HTTPS, host), auth),
             #[cfg(feature = "socks")]
             ProxyScheme::Socks5 { .. } => return self.connect_socks(dst, proxy_scheme).await,
+            #[cfg(unix)]
+            ProxyScheme::UnixSocket { socket } => return self.connect_unix_socket(socket).await,
         };
 
         #[cfg(feature = "__tls")]
@@ -608,6 +627,13 @@ impl TlsInfoFactory for hyper_rustls::MaybeHttpsStream<TokioIo<tokio::net::TcpSt
             hyper_rustls::MaybeHttpsStream::Https(tls) => tls.tls_info(),
             hyper_rustls::MaybeHttpsStream::Http(_) => None,
         }
+    }
+}
+
+#[cfg(all(feature = "__tls", unix))]
+impl TlsInfoFactory for UnixStream {
+    fn tls_info(&self) -> Option<crate::tls::TlsInfo> {
+        None
     }
 }
 
@@ -1086,6 +1112,91 @@ mod socks {
         };
 
         Ok(stream.into_inner())
+    }
+}
+
+#[cfg(unix)]
+mod unix_socket_conn {
+    use std::path::Path;
+    use hyper_util::client::legacy::connect::{Connected, Connection};
+    use hyper_util::rt::TokioIo;
+    use tokio::net::UnixStream;
+    use hyper::rt::{Read, Write};
+    use pin_project_lite::pin_project;
+    use crate::error::BoxError;
+
+    #[cfg(feature = "__tls")]
+    use super::TlsInfoFactory;
+
+    pub async fn connect<P: AsRef<Path>>(socket: P) -> Result<UnixStreamWrapper, BoxError> {
+        let target_stream = UnixStream::connect(&socket).await?;
+        Ok(UnixStreamWrapper { inner: TokioIo::new(target_stream) })
+    }
+
+    pin_project! {
+        /// This is only necessary because Connection is not implemented for TokioIo<UnixStream> in hyper_utils,
+        /// and I don't want to fork hyper_utils too.
+        pub struct UnixStreamWrapper {
+            #[pin]
+            inner: TokioIo<UnixStream>,
+        }
+    }
+
+    impl Connection for UnixStreamWrapper {
+        fn connected(&self) -> Connected {
+            let connected = Connected::new();
+            if let (Ok(_remote_addr), Ok(_local_addr)) = (self.inner.inner().peer_addr(), self.inner.inner().local_addr()) {
+                // cannot be done here, because of the visibility of HttpInfo's fields,
+                // but could be done if moved to hyper_util.
+
+                // connected.extra(HttpInfo { remote_addr, local_addr })
+                connected
+            } else {
+                connected
+            }
+        }
+    }
+
+    impl Write for UnixStreamWrapper {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<Result<usize, std::io::Error>> {
+            let proj = self.project();
+            proj.inner.poll_write(cx, buf)
+        }
+    
+        fn poll_flush(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<Result<(), std::io::Error>> {
+            let proj = self.project();
+            proj.inner.poll_flush(cx)
+        }
+    
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), std::io::Error>> {
+            let proj = self.project();
+            proj.inner.poll_shutdown(cx)
+        }
+    }
+
+    impl Read for UnixStreamWrapper {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: hyper::rt::ReadBufCursor<'_>,
+        ) -> std::task::Poll<Result<(), std::io::Error>> {
+           let proj = self.project();
+           proj.inner.poll_read(cx, buf)
+        }
+    }
+
+    #[cfg(feature = "__tls")]
+    impl TlsInfoFactory for UnixStreamWrapper {
+        fn tls_info(&self) -> Option<crate::tls::TlsInfo> {
+            None
+        }
     }
 }
 
